@@ -1,0 +1,6 @@
+.env
+thumbnails/*
+memes/*
+__*
+memes.db
+k8s

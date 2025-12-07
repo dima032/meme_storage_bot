@@ -1,0 +1,17 @@
+services:
+  meme-storage-bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./memes:/app/memes
+      - ./thumbnails:/app/thumbnails
+      - ./memes.db:/app/memes.db
+  http-server:
+    image: python:3.11-slim
+    command: python -m http.server 8000 --directory /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./memes:/app/memes
+      - ./thumbnails:/app/thumbnails
