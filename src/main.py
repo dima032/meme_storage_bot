@@ -1,5 +1,15 @@
 import logging
 import os
+import sys
+import asyncio
+import uvicorn
+import sqlite3
+import hashlib
+import tempfile
+import shutil
+from fastapi import FastAPI, HTTPException
+from starlette.responses import FileResponse
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultPhoto, Update
 from telegram.ext import (
     Application,
@@ -10,13 +20,57 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
 )
-from ml import get_tags
 import database as db
-import requests
 from PIL import Image
 import time
-from tenacity import retry, wait_fixed, stop_after_attempt, before_log, after_log, retry_if_exception_type, retry_if_exception_type
 import functools
+
+# --- Security Configuration ---
+URL_SIGNING_SECRET = os.environ.get("URL_SIGNING_SECRET")
+if not URL_SIGNING_SECRET:
+    logging.critical("FATAL: URL_SIGNING_SECRET environment variable not set.")
+    sys.exit(1)
+
+signer = URLSafeTimedSerializer(URL_SIGNING_SECRET)
+MEME_DIR = "/app/data/memes"
+THUMBNAIL_DIR = "/app/data/thumbnails"
+
+
+# --- FastAPI App Setup ---
+web_app = FastAPI()
+
+def _get_secure_file_path(token: str, base_dir: str):
+    """Validates a signed token and returns a secure file path."""
+    try:
+        # Validate token, max_age is 1 hour (3600 seconds)
+        filename = signer.loads(token, max_age=3600)
+    except (SignatureExpired, BadTimeSignature):
+        raise HTTPException(status_code=403, detail="Invalid or expired token")
+
+    # Path traversal check
+    full_path = os.path.abspath(os.path.join(base_dir, filename))
+    if not full_path.startswith(os.path.abspath(base_dir)):
+        raise HTTPException(status_code=403, detail="Path traversal attempt detected")
+        
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return full_path
+
+@web_app.get("/memes/{token:path}")
+async def serve_meme(token: str):
+    file_path = _get_secure_file_path(token, MEME_DIR)
+    return FileResponse(file_path, media_type="image/jpeg")
+
+@web_app.get("/thumbnails/{token:path}")
+async def serve_thumbnail(token: str):
+    file_path = _get_secure_file_path(token, THUMBNAIL_DIR)
+    return FileResponse(file_path, media_type="image/jpeg")
+
+# Health check endpoint
+@web_app.get("/")
+async def root():
+    return {"message": "Server is running"}
 
 # Enable logging
 logging.basicConfig(
@@ -44,7 +98,7 @@ def restricted(func):
             if update.message:
                 await update.message.reply_text("You are not authorized to use this bot.")
             elif update.inline_query:
-                await update.inline_query.answer([], cache_time=1) # Respond to inline query with empty results
+                await update.inline_query.answer([], cache_time=1)
             elif update.callback_query:
                 await update.callback_query.answer("You are not authorized to use this bot.", show_alert=True)
             return
@@ -52,100 +106,136 @@ def restricted(func):
     return wrapped
 
 
+def _calculate_hash(file_path):
+    """Calculates the SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
 
 @restricted
 async def start(update: Update, context) -> None:
     """Sends a message when the command /start is issued."""
     await update.message.reply_text("Hi! I'm your personal meme storage bot. "
-                                    "Send me a meme and I'll save it for you. "
+                                    "Send me a meme with a caption to tag it. "
                                     "You can also use inline mode to search for your memes by tags.")
 
 
 @restricted
 async def save_photo(update: Update, context) -> None:
-    """Saves the photo when a user sends one and processes manual tags from caption/text."""
-    file = await context.bot.get_file(update.message.photo[-1].file_id)
-    file_name = f"{file.file_id}.jpg"
+    """Saves the photo and tags, checking for duplicates using a content hash."""
+    photo_obj = update.message.photo[-1]
+    file = await context.bot.get_file(photo_obj.file_id)
+    file_name = f"{photo_obj.file_id}.jpg"
     
     conn = db.create_connection()
-    if conn is not None:
-        if db.meme_exists(conn, file_name):
-            await update.message.reply_text("This meme is already saved.")
-            conn.close()
-            return
-        
-        photo_path = f"memes/{file_name}"
-        thumbnail_path = f"thumbnails/{file_name}"
-        await file.download_to_drive(photo_path)
+    if conn is None:
+        await update.message.reply_text("Error connecting to the database.")
+        return
 
-        # Create and save thumbnail
-        logger.info(f"Creating thumbnail for {photo_path}")
-        try:
-            with Image.open(photo_path) as img:
-                img.thumbnail((320, 240))
-                img.save(thumbnail_path, "JPEG")
-            logger.info(f"Successfully created thumbnail: {thumbnail_path}")
-        except Exception as e:
-            logger.error(f"Could not create thumbnail for {photo_path}: {e}")
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            await file.download_to_drive(temp_file.name)
+            content_hash = _calculate_hash(temp_file.name)
 
-        # Get automatically generated tags from ML
-        tags = set(get_tags(photo_path)) # Convert to set for easy adding
+        photo_path = os.path.join(MEME_DIR, file_name)
+        thumbnail_path = os.path.join(THUMBNAIL_DIR, file_name)
         
-        # Process manual tags from caption or text message
-        manual_input = update.message.caption if update.message.caption else update.message.text
+        tags = set()
+        manual_input = update.message.caption if update.message.caption else ""
         if manual_input:
-            logger.info(f"Processing manual input for tags: '{manual_input}'")
-            manual_words = manual_input.split()
-            for word in manual_words:
+            for word in manual_input.split():
                 clean_word = ''.join(filter(str.isalnum, word)).lower()
                 if len(clean_word) > 2:
                     tags.add(clean_word)
         
-        db.insert_meme(conn, (file_name, ','.join(tags)))
-        conn.close()
+        try:
+            db.insert_meme(conn, (content_hash, file_name, ','.join(tags)))
+            shutil.move(temp_file.name, photo_path)
+            
+            logger.info(f"Creating thumbnail for {photo_path}")
+            try:
+                with Image.open(photo_path) as img:
+                    img.thumbnail((320, 240))
+                    img.save(thumbnail_path, "JPEG")
+                logger.info(f"Successfully created thumbnail: {thumbnail_path}")
+            except Exception as e:
+                logger.error(f"Could not create thumbnail for {photo_path}: {e}")
 
-        await update.message.reply_text(f"Meme saved with tags: {', '.join(tags)}")
-    else:
-        await update.message.reply_text("Error connecting to the database.")
+            if tags:
+                await update.message.reply_text(f"Meme saved with tags: {', '.join(tags)}")
+            else:
+                await update.message.reply_text("Meme saved. Add a caption to save with tags.")
 
+        except sqlite3.IntegrityError:
+            logger.info(f"Duplicate meme received with content_hash: {content_hash}")
+            await update.message.reply_text("This meme is already saved.")
+            os.remove(temp_file.name)
+
+    finally:
+        if conn:
+            conn.close()
 
 @restricted
 async def inline_query(update: Update, context) -> None:
     """Handle the inline query."""
-    query = update.inline_query.query
+    query = update.inline_query.query.lower()
     
     conn = db.create_connection()
-    if conn is not None:
-        if query:
-            results = db.find_memes_by_tag(conn, query)
-        else:
-            results = db.get_all_memes(conn)
-        conn.close()
+    if conn is None: return
+    
+    all_memes = db.get_all_memes(conn)
+    conn.close()
+
+    results = []
+    if query:
+        search_tags = {tag.strip() for tag in query.split() if len(tag.strip()) > 0}
+        for meme in all_memes:
+            meme_tags = {t.strip() for t in meme[2].split(',') if t.strip()}
+            if search_tags.issubset(meme_tags):
+                results.append(meme)
     else:
-        results = []
+        results = all_memes
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    results = results[:50]
 
     inline_results = []
     public_url = os.environ.get("PUBLIC_URL")
-    logger.info(f"Using public URL: {public_url}")
-
+    if public_url and not public_url.startswith("http"):
+        public_url = f"https://{public_url}"
+    
     for result in results:
-        photo_url = f"{public_url}/memes/{result[1]}"
-        thumbnail_url = f"{public_url}/thumbnails/{result[1]}"
-        meme_path = f"memes/{result[1]}"
+        filename = result[1]
+        photo_token = signer.dumps(filename)
+        thumb_token = signer.dumps(filename) # Can use the same token
+        
+        photo_url = f"{public_url}/memes/{photo_token}"
+        thumbnail_url = f"{public_url}/thumbnails/{thumb_token}"
+        photo_path = os.path.join(MEME_DIR, filename)
+
+        width, height = 0, 0
         try:
-            # Note: We don't need to open the image here to get width/height,
-            # as Telegram clients typically handle that.
-            # This improves performance by avoiding disk I/O.
+            with Image.open(photo_path) as img:
+                width, height = img.size
+        except Exception as e:
+            logger.error(f"Could not open image {photo_path} to get dimensions: {e}")
+            continue
+
+        try:
             inline_results.append(
                 InlineQueryResultPhoto(
                     id=f"{result[0]}_{time.time()}",
                     photo_url=photo_url,
                     thumbnail_url=thumbnail_url,
+                    photo_width=width,
+                    photo_height=height,
                 )
             )
         except Exception as e:
-            logger.error(f"Error creating inline result for {meme_path}: {e}")
+            logger.error(f"Error creating inline result for meme {filename}: {e}")
 
     logger.info(f"Inline results being sent: {len(inline_results)} items")
     await update.inline_query.answer(inline_results, cache_time=1)
@@ -155,18 +245,18 @@ async def inline_query(update: Update, context) -> None:
 async def dump(update: Update, context) -> None:
     """Dumps the database content to the chat."""
     conn = db.create_connection()
-    if conn is not None:
-        memes = db.get_all_memes(conn)
-        conn.close()
-    else:
-        memes = []
+    if conn is None: return
+    
+    memes = db.get_all_memes(conn)
+    conn.close()
     
     message = "Database content:\n"
     for meme in memes:
-        message += f"ID: {meme[0]}, Path: {meme[1]}, Tags: {meme[2]}\n"
+        message += f"ID: {meme[0]}, Path: {meme[1]}, Tags: {meme[2]}, Hash: {meme[3]}\n"
     
-    await update.message.reply_text(message)
-    
+    for i in range(0, len(message), 4096):
+        await update.message.reply_text(message[i:i + 4096])
+
 
 # States for conversation
 CONFIRM_CLEAR, CANCEL_CLEAR = range(2)
@@ -174,12 +264,8 @@ CONFIRM_CLEAR, CANCEL_CLEAR = range(2)
 @restricted
 async def clear(update: Update, context) -> int:
     """Asks for confirmation to clear the database."""
-    keyboard = [
-        [
-            InlineKeyboardButton("Yes, clear it", callback_data=str(CONFIRM_CLEAR)),
-            InlineKeyboardButton("No, cancel", callback_data=str(CANCEL_CLEAR)),
-        ]
-    ]
+    keyboard = [[InlineKeyboardButton("Yes, clear it", callback_data=str(CONFIRM_CLEAR)),
+                 InlineKeyboardButton("No, cancel", callback_data=str(CANCEL_CLEAR))]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Are you sure you want to clear the entire meme database? This action cannot be undone.", reply_markup=reply_markup)
     return CONFIRM_CLEAR
@@ -193,7 +279,7 @@ async def clear_confirmation(update: Update, context) -> int:
     
     if query.data == str(CONFIRM_CLEAR):
         conn = db.create_connection()
-        if conn is not None:
+        if conn:
             db.clear_database(conn)
             conn.close()
             await query.edit_message_text(text="Database cleared.")
@@ -201,15 +287,13 @@ async def clear_confirmation(update: Update, context) -> int:
             await query.edit_message_text(text="Error connecting to the database.")
     else:
         await query.edit_message_text(text="Operation cancelled.")
-        
     return ConversationHandler.END
 
 
 @restricted
 async def regenerate_thumbnails(update: Update, context) -> None:
     """Generates thumbnails for all existing memes that don't have one."""
-    logger.info("Starting thumbnail regeneration for existing memes...")
-    await update.message.reply_text("Starting thumbnail regeneration for existing memes...")
+    await update.message.reply_text("Starting thumbnail regeneration...")
     
     conn = db.create_connection()
     if conn is None:
@@ -224,124 +308,119 @@ async def regenerate_thumbnails(update: Update, context) -> None:
     
     for meme in memes:
         file_name = meme[1]
-        logger.info(f"Processing meme: {file_name}")
-        photo_path = f"memes/{file_name}"
-        thumbnail_path = f"thumbnails/{file_name}"
+        photo_path = os.path.join(MEME_DIR, file_name)
+        thumbnail_path = os.path.join(THUMBNAIL_DIR, file_name)
 
         if not os.path.exists(photo_path):
             logger.warning(f"Source meme image not found: {photo_path}")
             continue
         
         if os.path.exists(thumbnail_path):
-            logger.info(f"Thumbnail already exists, skipping: {thumbnail_path}")
             skipped_count += 1
             continue
             
         try:
-            logger.info(f"Creating thumbnail for {photo_path}")
             with Image.open(photo_path) as img:
                 img.thumbnail((320, 240))
                 img.save(thumbnail_path, "JPEG")
-            logger.info(f"Successfully created thumbnail: {thumbnail_path}")
             generated_count += 1
+            logger.info(f"Generated thumbnail for {file_name}")
         except Exception as e:
             logger.error(f"Could not create thumbnail for {photo_path}: {e}")
 
-    await update.message.reply_text(f"Thumbnail regeneration complete.\n"
-                                    f"Generated: {generated_count}\n"
-                                    f"Skipped: {skipped_count}")
+    await update.message.reply_text(f"Thumbnail regeneration complete. Generated: {generated_count}, Skipped: {skipped_count}")
 
 
 @restricted
-async def rescan_memes(update: Update, context) -> None:
-    """Scans the memes folder for orphan images and adds them to the database."""
-    await update.message.reply_text("Starting scan for orphan memes...")
-    logger.info("Starting scan for orphan memes...")
+async def rescan(update: Update, context) -> None:
+    """Scans the memes folder for images not present in the database."""
+    await update.message.reply_text("Starting library rescan...")
 
-    # 1. Get all files on disk
-    try:
-        disk_memes = {f for f in os.listdir('memes') if os.path.isfile(os.path.join('memes', f))}
-    except FileNotFoundError:
-        await update.message.reply_text("Error: 'memes' directory not found.")
-        logger.error("Could not find 'memes' directory during rescan.")
-        return
-
-    # 2. Get all files in database
     conn = db.create_connection()
     if conn is None:
-        await update.message.reply_text("Error: Could not connect to the database.")
+        await update.message.reply_text("Error connecting to the database.")
         return
-    db_memes_records = db.get_all_memes(conn)
-    db_memes = {record[1] for record in db_memes_records} # record[1] is the file_name
-
-    # 3. Find the difference
-    orphan_memes = disk_memes - db_memes
-    logger.info(f"Found {len(orphan_memes)} orphan memes to process.")
     
-    if not orphan_memes:
-        await update.message.reply_text("Scan complete. No orphan memes found.")
-        conn.close()
-        return
+    try:
+        existing_hashes = db.get_all_hashes(conn)
+        added_count = 0
+        thumb_generated_count = 0
+        
+        if not os.path.isdir(MEME_DIR):
+            await update.message.reply_text(f"Error: Meme directory not found at {MEME_DIR}")
+            return
 
-    newly_added_count = 0
-    await update.message.reply_text(f"Found {len(orphan_memes)} orphan memes. Processing now... This may take a while.")
-
-    for file_name in orphan_memes:
-        logger.info(f"Processing orphan meme: {file_name}")
-        photo_path = f"memes/{file_name}"
-        thumbnail_path = f"thumbnails/{file_name}"
-
-        # 4. Generate tags and thumbnail, then insert into DB
-        try:
-            # Generate tags
-            tags = set(get_tags(photo_path))
+        for filename in os.listdir(MEME_DIR):
+            file_path = os.path.join(MEME_DIR, filename)
+            if not os.path.isfile(file_path):
+                continue
             
-            # Create thumbnail
-            with Image.open(photo_path) as img:
-                img.thumbnail((320, 240))
-                img.save(thumbnail_path, "JPEG")
+            content_hash = _calculate_hash(file_path)
             
-            # Insert into database
-            db.insert_meme(conn, (file_name, ','.join(tags)))
-            logger.info(f"Successfully processed and added to DB: {file_name}")
-            newly_added_count += 1
-        except Exception as e:
-            logger.error(f"Failed to process orphan meme {file_name}: {e}", exc_info=True)
-    
-    conn.close()
-    await update.message.reply_text(f"Rescan complete. Successfully added {newly_added_count} new memes to the database.")
+            if content_hash not in existing_hashes:
+                try:
+                    db.insert_meme(conn, (content_hash, filename, ""))
+                    added_count += 1
+                    logger.info(f"Added new meme from scan: {filename}")
+                except sqlite3.IntegrityError:
+                    logger.warning(f"Meme from scan was already in DB (race condition): {filename}")
+                    continue
+            
+            thumbnail_path = os.path.join(THUMBNAIL_DIR, filename)
+            if not os.path.exists(thumbnail_path):
+                try:
+                    with Image.open(file_path) as img:
+                        img.thumbnail((320, 240))
+                        img.save(thumbnail_path, "JPEG")
+                    thumb_generated_count += 1
+                    logger.info(f"Generated missing thumbnail for {filename}")
+                except Exception as e:
+                    logger.error(f"Could not create thumbnail for {file_path}: {e}")
+
+        await update.message.reply_text(f"Rescan complete. Added: {added_count} new memes. Generated: {thumb_generated_count} missing thumbnails.")
+
+    finally:
+        if conn:
+            conn.close()
 
 
-def main() -> None:
-    """Start the bot."""
-    # Create the Application and pass it your bot's token.
+async def main() -> None:
+    """Runs the bot and the web server concurrently."""
     application = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
 
-    # Create a conversation handler for the /clear command
     clear_handler = ConversationHandler(
         entry_points=[CommandHandler("clear", clear)],
-        states={
-            CONFIRM_CLEAR: [CallbackQueryHandler(clear_confirmation)],
-        },
+        states={CONFIRM_CLEAR: [CallbackQueryHandler(clear_confirmation)]},
         fallbacks=[CommandHandler("clear", clear)],
     )
 
-    # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dump", dump))
     application.add_handler(CommandHandler("regenerate_thumbnails", regenerate_thumbnails))
-    application.add_handler(CommandHandler("rescan", rescan_memes))
+    application.add_handler(CommandHandler("rescan", rescan))
     application.add_handler(clear_handler)
-
-    # on non command i.e message - save the image on filesystem
     application.add_handler(MessageHandler(filters.PHOTO, save_photo))
-
-    # on inline query
     application.add_handler(InlineQueryHandler(inline_query))
+    
+    config = uvicorn.Config(web_app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling()
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        logger.info("Telegram Bot started.")
+        
+        await server.serve()
+        logger.info("Web server stopped.")
+        
+        await application.updater.stop()
+        await application.stop()
+        logger.info("Telegram Bot stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")

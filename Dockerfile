@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN mkdir -p memes thumbnails
 
-RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus && rm -rf /var/lib/apt/lists/*
+
 
 COPY requirements.txt .
 

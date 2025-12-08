@@ -1,6 +1,7 @@
 python-telegram-bot
 requests
 Pillow
-opencv-python-headless
-pytesseract
 tenacity
+fastapi
+uvicorn[standard]
+itsdangerous
