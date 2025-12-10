@@ -21,6 +21,7 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 import database as db
+import ml
 from PIL import Image
 import time
 import functools
@@ -125,36 +126,53 @@ async def start(update: Update, context) -> None:
 
 @restricted
 async def save_photo(update: Update, context) -> None:
-    """Saves the photo and tags, checking for duplicates using a content hash."""
+    """Saves the photo, extracts tags via OCR and caption, and checks for duplicates."""
     photo_obj = update.message.photo[-1]
     file = await context.bot.get_file(photo_obj.file_id)
     file_name = f"{photo_obj.file_id}.jpg"
-    
+
     conn = db.create_connection()
     if conn is None:
         await update.message.reply_text("Error connecting to the database.")
         return
 
+    temp_file_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            await file.download_to_drive(temp_file.name)
-            content_hash = _calculate_hash(temp_file.name)
+            temp_file_path = temp_file.name
+            await file.download_to_drive(temp_file_path)
+            content_hash = _calculate_hash(temp_file_path)
 
         photo_path = os.path.join(MEME_DIR, file_name)
         thumbnail_path = os.path.join(THUMBNAIL_DIR, file_name)
-        
+
+        # Get tags from both OCR and user caption
         tags = set()
+        
+        # 1. Get tags from OCR
+        logger.info(f"Running OCR on {temp_file_path}...")
+        ocr_tags = ml.get_tags_for_image(temp_file_path)
+        if ocr_tags:
+            tags.update(ocr_tags)
+            logger.info(f"OCR tags found: {', '.join(ocr_tags)}")
+        
+        # 2. Get tags from caption
         manual_input = update.message.caption if update.message.caption else ""
         if manual_input:
+            caption_tags = set()
             for word in manual_input.split():
                 clean_word = ''.join(filter(str.isalnum, word)).lower()
                 if len(clean_word) > 2:
-                    tags.add(clean_word)
-        
+                    caption_tags.add(clean_word)
+            tags.update(caption_tags)
+
+        # Save to database
         try:
-            db.insert_meme(conn, (content_hash, file_name, ','.join(tags)))
-            shutil.move(temp_file.name, photo_path)
-            
+            db.insert_meme(conn, (content_hash, file_name, ','.join(sorted(list(tags)))))
+            shutil.move(temp_file_path, photo_path)
+            temp_file_path = None # Prevent deletion in finally block
+
+            # Create thumbnail
             logger.info(f"Creating thumbnail for {photo_path}")
             try:
                 with Image.open(photo_path) as img:
@@ -163,20 +181,23 @@ async def save_photo(update: Update, context) -> None:
                 logger.info(f"Successfully created thumbnail: {thumbnail_path}")
             except Exception as e:
                 logger.error(f"Could not create thumbnail for {photo_path}: {e}")
-
+            
+            # Send confirmation message
             if tags:
-                await update.message.reply_text(f"Meme saved with tags: {', '.join(tags)}")
+                await update.message.reply_text(f"Meme saved with tags (OCR + Caption): {', '.join(sorted(list(tags)))}")
             else:
-                await update.message.reply_text("Meme saved. Add a caption to save with tags.")
+                await update.message.reply_text("Meme saved. No tags were found via OCR or caption.")
 
         except sqlite3.IntegrityError:
             logger.info(f"Duplicate meme received with content_hash: {content_hash}")
             await update.message.reply_text("This meme is already saved.")
-            os.remove(temp_file.name)
 
     finally:
         if conn:
             conn.close()
+        # Clean up temp file if it wasn't moved
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 @restricted
 async def inline_query(update: Update, context) -> None:
@@ -333,7 +354,7 @@ async def regenerate_thumbnails(update: Update, context) -> None:
 
 @restricted
 async def rescan(update: Update, context) -> None:
-    """Scans the memes folder for images not present in the database."""
+    """Scans the memes folder for images not in the DB, runs OCR, and adds them."""
     await update.message.reply_text("Starting library rescan...")
 
     conn = db.create_connection()
@@ -350,6 +371,7 @@ async def rescan(update: Update, context) -> None:
             await update.message.reply_text(f"Error: Meme directory not found at {MEME_DIR}")
             return
 
+        await update.message.reply_text("Scanning files... This may take a while if OCR is needed.")
         for filename in os.listdir(MEME_DIR):
             file_path = os.path.join(MEME_DIR, filename)
             if not os.path.isfile(file_path):
@@ -359,9 +381,12 @@ async def rescan(update: Update, context) -> None:
             
             if content_hash not in existing_hashes:
                 try:
-                    db.insert_meme(conn, (content_hash, filename, ""))
+                    logger.info(f"New meme found: {filename}. Running OCR...")
+                    tags = ml.get_tags_for_image(file_path)
+                    
+                    db.insert_meme(conn, (content_hash, filename, ','.join(sorted(list(tags)))))
                     added_count += 1
-                    logger.info(f"Added new meme from scan: {filename}")
+                    logger.info(f"Added new meme from scan: {filename} with tags: {', '.join(tags)}")
                 except sqlite3.IntegrityError:
                     logger.warning(f"Meme from scan was already in DB (race condition): {filename}")
                     continue
@@ -384,6 +409,54 @@ async def rescan(update: Update, context) -> None:
             conn.close()
 
 
+@restricted
+async def retag_all(update: Update, context) -> None:
+    """Iterates through all memes in the DB, re-runs OCR, and updates their tags."""
+    await update.message.reply_text("Starting to re-tag all memes... This will take a while.")
+
+    conn = db.create_connection()
+    if conn is None:
+        await update.message.reply_text("Error connecting to the database.")
+        return
+    
+    try:
+        all_memes = db.get_all_memes(conn)
+        total_memes = len(all_memes)
+        processed_count = 0
+        
+        logger.info(f"Starting re-tagging process for {total_memes} memes.")
+
+        for i, meme in enumerate(all_memes):
+            _, file_name, old_tags, content_hash = meme
+            
+            if content_hash is None:
+                logger.warning(f"Skipping meme with missing content_hash: {file_name}")
+                continue
+
+            file_path = os.path.join(MEME_DIR, file_name)
+            if not os.path.exists(file_path):
+                logger.warning(f"Meme file not found, skipping: {file_path}")
+                continue
+
+            logger.info(f"Re-tagging {file_path} ({i+1}/{total_memes})")
+            new_tags = ml.get_tags_for_image(file_path)
+            
+            # Here you might want to merge with existing manual tags if you have them.
+            # For now, we'll just overwrite with the new OCR tags.
+            db.update_meme_tags(conn, content_hash, ','.join(sorted(list(new_tags))))
+            processed_count += 1
+
+        logger.info("Re-tagging process finished.")
+        await update.message.reply_text(f"Re-tagging complete. Processed {processed_count}/{total_memes} memes.")
+
+    except Exception as e:
+        logger.error(f"An error occurred during re-tagging: {e}")
+        await update.message.reply_text(f"An error occurred: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
 async def main() -> None:
     """Runs the bot and the web server concurrently."""
     application = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
@@ -398,6 +471,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("dump", dump))
     application.add_handler(CommandHandler("regenerate_thumbnails", regenerate_thumbnails))
     application.add_handler(CommandHandler("rescan", rescan))
+    application.add_handler(CommandHandler("retag", retag_all))
     application.add_handler(clear_handler)
     application.add_handler(MessageHandler(filters.PHOTO, save_photo))
     application.add_handler(InlineQueryHandler(inline_query))

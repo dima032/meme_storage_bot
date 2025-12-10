@@ -4,3 +4,5 @@ memes/*
 __*
 memes.db
 k8s
+docker-compose.yml
+*.md

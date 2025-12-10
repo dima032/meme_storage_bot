@@ -7,7 +7,6 @@ on:
       - 'Dockerfile'
       - 'requirements.txt'
       - 'src/**'
-      - 'k8s/**'
       - '.github/workflows/dockerhub.yaml'
 
 jobs:

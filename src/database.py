@@ -98,3 +98,16 @@ def clear_database(conn):
     conn.commit()
 
 
+def update_meme_tags(conn, content_hash, tags):
+    """
+    Update the tags for a specific meme by its content_hash.
+    :param conn: the Connection object
+    :param content_hash: The hash of the meme to update
+    :param tags: The new comma-separated string of tags
+    """
+    sql = ''' UPDATE memes
+              SET tags = ?
+              WHERE content_hash = ?'''
+    cur = conn.cursor()
+    cur.execute(sql, (tags, content_hash))
+    conn.commit()

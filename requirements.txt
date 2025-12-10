@@ -5,3 +5,11 @@ tenacity
 fastapi
 uvicorn[standard]
 itsdangerous
+transformers
+torch
+sentencepiece
+timm
+protobuf
+einops
+bitsandbytes
+accelerate
