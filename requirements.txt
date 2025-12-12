@@ -1,7 +1,5 @@
 python-telegram-bot
-requests
 Pillow
-tenacity
 fastapi
 uvicorn[standard]
 itsdangerous

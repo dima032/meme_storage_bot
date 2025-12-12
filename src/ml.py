@@ -20,19 +20,16 @@ processor = None
 model = None
 
 # Get model and token from environment variables
-# Note: Florence-2 is not gated, but we keep the token for other models.
-model_name = "microsoft/Florence-2-large"
+model_name = "PaddlePaddle/PaddleOCR-VL"
 hf_token = os.environ.get("HUGGING_FACE_TOKEN")
 
 try:
     logger.info(f"Initializing OCR processor and model: {model_name}...")
-    # Florence-2 uses AutoModelForCausalLM and AutoProcessor
-    # We add load_in_8bit=True to reduce memory usage and attn_implementation to avoid SDPA error.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
         token=hf_token,
-        load_in_8bit=True,
+        # load_in_8bit=True, # Temporarily disabled to check for memory issues
         device_map="auto",
         attn_implementation="eager",
         torch_dtype=torch.float16,
@@ -49,7 +46,7 @@ except Exception as e:
 
 def get_tags_for_image(image_path: str) -> list[str]:
     """
-    Extracts text from an image using Florence-2 and returns a list of cleaned words (tags).
+    Extracts text from an image using PaddleOCR-VL and returns a list of cleaned words (tags).
     """
     if not processor or not model:
         logger.error("OCR processor or model is not available. Cannot process image.")
@@ -63,31 +60,27 @@ def get_tags_for_image(image_path: str) -> list[str]:
         logger.info(f"Processing image: {image_path}")
         image = Image.open(image_path).convert("RGB")
 
-        # Florence-2 requires a specific task prompt
-        prompt = "<OCR>"
-
-        # Process the image and prompt
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-
-        # Manually cast inputs to the correct dtype and device to match the model
+        # Prepare the prompt for PaddleOCR-VL
+        messages = [{"role": "user", "content": f"<image>\nOCR"}]
+        prompt_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = processor(text=[prompt_text], images=[image], return_tensors="pt")
         inputs = {key: value.to(model.device, dtype=torch.float16 if value.dtype == torch.float32 else value.dtype) for key, value in inputs.items()}
 
         # Generate text
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            use_cache=False,
-        )
+        with torch.inference_mode():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                do_sample=False,
+                use_cache=True,
+            )
         
-        # Decode the generated text
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-
-        # The model's output includes the prompt, so we need to parse it
-        parsed_answer = processor.post_process_generation(generated_text, task="<OCR>", image_size=(image.width, image.height))
+        # Decode and parse the generated text
+        response = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        # The response includes the prompt, so we split it to get only the answer
+        text = response.split(prompt_text)[-1].strip()
         
-        # The parsed answer is a dict, e.g. {'<OCR>': 'text from image'}
-        text = parsed_answer.get('<OCR>', '')
         logger.info(f"Generated text: {text}")
 
         # Use regex to find all words that are at least 3 characters long
@@ -100,7 +93,7 @@ def get_tags_for_image(image_path: str) -> list[str]:
         return tags
 
     except Exception as e:
-        logger.error(f"Error processing image {image_path} with Florence-2: {e}")
+        logger.error(f"Error processing image {image_path} with PaddleOCR-VL: {e}")
         logger.error(traceback.format_exc())
         return []
 
